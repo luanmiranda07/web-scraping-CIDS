@@ -1,11 +1,11 @@
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, StaleElementReferenceException, ElementClickInterceptedException
-import time
-import random
+import time, random, os, json
+from openpyxl import Workbook, load_workbook
 
 # ===== Configurações de espera =====
 WAIT_SHORT = 10        # cliques/cookies
@@ -13,12 +13,83 @@ WAIT_LONG  = 60        # carregamentos de páginas/tabelas
 POLL_SLEEP = 0.25      # intervalo do polling leve
 POST_CLICK_SLEEP = 0.35  # pausa pós-clique para animações
 
+# ===== Arquivos de saída/checkpoint =====
+EXCEL_PATH = "cids.xlsx"
+EXCEL_SHEET = "dados"
+PROGRESS_PATH = "progress.json"
+
+# ---------- Utilitários Excel (openpyxl) ----------
+def ensure_workbook():
+    """
+    Garante que o arquivo EXCEL_PATH exista com a planilha e cabeçalho.
+    """
+    if not os.path.exists(EXCEL_PATH):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = EXCEL_SHEET
+        ws.append(["categoria_codigo", "categoria_descricao", "cid_codigo", "cid_descricao"])
+        wb.save(EXCEL_PATH)
+    else:
+        wb = load_workbook(EXCEL_PATH)
+        if EXCEL_SHEET not in wb.sheetnames:
+            ws = wb.create_sheet(EXCEL_SHEET)
+            ws.append(["categoria_codigo", "categoria_descricao", "cid_codigo", "cid_descricao"])
+            wb.save(EXCEL_PATH)
+
+def load_processed_categories_from_xlsx():
+    """
+    Lê o Excel e devolve um set com os códigos de categoria já processados (coluna A).
+    Ignora vazios.
+    """
+    ensure_workbook()
+    processed = set()
+    wb = load_workbook(EXCEL_PATH, read_only=True, data_only=True)
+    ws = wb[EXCEL_SHEET]
+    first = True
+    for row in ws.iter_rows(values_only=True):
+        if first:
+            first = False
+            continue  # pula cabeçalho
+        if not row:
+            continue
+        cod = (row[0] or "").strip() if isinstance(row[0], str) else (str(row[0]) if row[0] is not None else "")
+        if cod:
+            processed.add(cod)
+    wb.close()
+    return processed
+
+def append_rows_xlsx(rows):
+    """
+    Acrescenta linhas ao Excel incrementalmente.
+    rows: lista de listas [categoria_codigo, categoria_descricao, cid_codigo, cid_descricao]
+    """
+    ensure_workbook()
+    wb = load_workbook(EXCEL_PATH)
+    ws = wb[EXCEL_SHEET]
+    for r in rows:
+        ws.append(r)
+    wb.save(EXCEL_PATH)
+    wb.close()
+
+# ---------- Checkpoint ----------
+def load_progress():
+    if not os.path.exists(PROGRESS_PATH):
+        return {"pagina_atual": 1, "proximo_indice_da_pagina": 0}
+    with open(PROGRESS_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def save_progress(pagina_atual, proximo_indice_da_pagina):
+    data = {"pagina_atual": pagina_atual, "proximo_indice_da_pagina": proximo_indice_da_pagina}
+    with open(PROGRESS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+# ---------- Selenium helpers ----------
 opts = Options()
-# opts.add_argument("--headless=new")  # ative se quiser rodar sem abrir janela
-opts.add_argument("--disable-notifications")
 opts.add_argument("--headless=new")
+opts.add_argument("--disable-notifications")
 opts.add_argument("--disable-gpu")
 opts.add_argument("--no-sandbox")
+opts.add_argument("--window-size=1366,768")
 
 driver = webdriver.Chrome(options=opts)
 wait = WebDriverWait(driver, WAIT_LONG)
@@ -101,9 +172,51 @@ def click_voltar():
         WebDriverWait(driver, WAIT_LONG).until(EC.presence_of_element_located((By.ID, "tbCategorias")))
 
 def go_next_page() -> bool:
-    """Tenta ir para a próxima página de categorias. Retorna True se conseguiu, False se não há próxima."""
+    """
+    Vai para a próxima página da tabela de categorias (DataTables).
+    Retorna True se conseguiu avançar, False se já está na última.
+    """
     switch_into_categorias(driver, wait)
 
+    # 1) Preferência: DataTables (#tbCategorias_next)
+    try:
+        next_btn = driver.find_element(By.ID, "tbCategorias_next")
+        cls = (next_btn.get_attribute("class") or "").lower()
+        if "disabled" in cls:
+            return False
+
+        def first_row_key():
+            try:
+                rows = driver.find_elements(By.CSS_SELECTOR, "#tbCategorias > tbody > tr")
+                if not rows:
+                    return ""
+                tds = rows[0].find_elements(By.TAG_NAME, "td")
+                if len(tds) < 2:
+                    return ""
+                return (tds[0].text or "").strip() + "|" + (tds[1].text or "").strip()
+            except Exception:
+                return ""
+
+        before_key = first_row_key()
+        safe_click(next_btn)
+
+        WebDriverWait(driver, WAIT_LONG).until(EC.presence_of_element_located((By.ID, "tbCategorias")))
+
+        for _ in range(60):  # ~15s
+            time.sleep(POLL_SLEEP)
+            after_key = first_row_key()
+            rows_now = driver.find_elements(By.CSS_SELECTOR, "#tbCategorias > tbody > tr")
+            if after_key and after_key != before_key:
+                return True
+            if rows_now:
+                rows_prev = driver.find_elements(By.CSS_SELECTOR, "#tbCategorias > tbody > tr")
+                if len(rows_now) != len(rows_prev):
+                    return True
+        return False
+    except Exception:
+        pass
+
+    # 2) Fallback: seletores genéricos
     candidatos = [
         (By.XPATH, "//a[contains(., 'Próxima') or contains(., 'Proxima') or contains(., 'Next')]"),
         (By.XPATH, "//button[contains(., 'Próxima') or contains(., 'Proxima') or contains(., 'Next')]"),
@@ -112,32 +225,41 @@ def go_next_page() -> bool:
         (By.XPATH, "//a[.//svg or .//i][contains(@class,'next') or contains(@aria-label,'Próxima') or contains(@aria-label,'Next')]"),
     ]
 
+    def first_row_key():
+        try:
+            rows = driver.find_elements(By.CSS_SELECTOR, "#tbCategorias > tbody > tr")
+            if not rows:
+                return ""
+            tds = rows[0].find_elements(By.TAG_NAME, "td")
+            if len(tds) < 2:
+                return ""
+            return (tds[0].text or "").strip() + "|" + (tds[1].text or "").strip()
+        except Exception:
+            return ""
+
     for by, sel in candidatos:
         try:
-            btns = driver.find_elements(by, sel)
-            btns = [b for b in btns if b.is_displayed() and b.is_enabled()]
-            if not btns:
+            buttons = driver.find_elements(by, sel)
+            buttons = [b for b in buttons if b.is_displayed() and b.is_enabled()]
+            if not buttons:
                 continue
 
-            for btn in btns:
+            for btn in buttons:
                 cls = (btn.get_attribute("class") or "").lower()
                 aria_disabled = (btn.get_attribute("aria-disabled") or "").lower()
                 if "disabled" in cls or aria_disabled == "true":
                     continue
 
-                linhas_antes = driver.find_elements(By.CSS_SELECTOR, "#tbCategorias > tbody > tr")
-                num_antes = len(linhas_antes)
-
+                before_key = first_row_key()
                 safe_click(btn)
 
                 try:
                     WebDriverWait(driver, WAIT_LONG).until(EC.presence_of_element_located((By.ID, "tbCategorias")))
-                    for _ in range(40):  # até ~10s
+                    for _ in range(60):  # ~15s
                         time.sleep(POLL_SLEEP)
-                        linhas_depois = driver.find_elements(By.CSS_SELECTOR, "#tbCategorias > tbody > tr")
-                        if len(linhas_depois) != num_antes or linhas_depois != linhas_antes:
+                        after_key = first_row_key()
+                        if after_key and after_key != before_key:
                             return True
-                    # mesmo número; pode ser última página
                     return False
                 except TimeoutException:
                     switch_into_categorias(driver, wait)
@@ -146,7 +268,44 @@ def go_next_page() -> bool:
             continue
     return False
 
+def set_page_size_100():
+    """Seleciona 100 resultados por página no seletor #tbCategorias_length > label > select e
+    espera a tabela redesenhar (mais linhas na página)."""
+    switch_into_categorias(driver, wait)
+
+    select_el = WebDriverWait(driver, WAIT_LONG).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, "#tbCategorias_length > label > select"))
+    )
+
+    linhas_antes = driver.find_elements(By.CSS_SELECTOR, "#tbCategorias > tbody > tr")
+    num_antes = len(linhas_antes)
+
+    try:
+        sel = Select(select_el)
+        try:
+            sel.select_by_value("100")
+        except Exception:
+            sel.select_by_visible_text("100")
+    except Exception:
+        driver.execute_script("""
+            const s = document.querySelector('#tbCategorias_length > label > select');
+            if (s) { s.value = '100'; s.dispatchEvent(new Event('change', {bubbles: true})); }
+        """)
+
+    for _ in range(60):  # ~15s
+        time.sleep(POLL_SLEEP)
+        linhas_depois = driver.find_elements(By.CSS_SELECTOR, "#tbCategorias > tbody > tr")
+        if len(linhas_depois) > num_antes or linhas_depois != linhas_antes:
+            break
+
+# ========= INÍCIO =========
 try:
+    # Progresso + categorias já processadas (para evitar duplicados ao retomar)
+    progress = load_progress()
+    processed_codes = load_processed_categories_from_xlsx()
+    pagina_alvo = progress.get("pagina_atual", 1)
+    i_alvo = progress.get("proximo_indice_da_pagina", 0)
+
     driver.get("https://www.cremesp.org.br/?siteAcao=cid10")
 
     # Aceitar cookies se aparecer
@@ -158,81 +317,136 @@ try:
     except Exception:
         pass
 
-    # Entrar no contexto correto da tabela
+    # Entrar no contexto correto e setar 100 por página
     switch_into_categorias(driver, wait)
+    set_page_size_100()
 
+    # ===== LOOP PRINCIPAL: percorre todas as páginas =====
     pagina = 1
+    i = 0  # índice corrente na página
+
+    # Retomada: avança até a página alvo
+    while pagina < pagina_alvo:
+        if not go_next_page():
+            break
+        pagina += 1
+        switch_into_categorias(driver, wait)
+        WebDriverWait(driver, WAIT_LONG).until(EC.presence_of_element_located((By.ID, "tbCategorias")))
+        set_page_size_100()
+        for _ in range(40):
+            time.sleep(POLL_SLEEP)
+            if driver.find_elements(By.CSS_SELECTOR, "#tbCategorias > tbody > tr"):
+                break
+
+    # começa do índice salvo, se houver retomada
+    i = i_alvo
+    save_progress(pagina, i)
+
     while True:
         switch_into_categorias(driver, wait)
-
         linhas = driver.find_elements(By.CSS_SELECTOR, "#tbCategorias > tbody > tr")
-        if not linhas:
-            break
 
-        print(f"\n=== Página {pagina} | Categorias visíveis: {len(linhas)} ===")
-
-        # Percorre TODAS as linhas desta página
-        for i in range(len(linhas)):
-            switch_into_categorias(driver, wait)
-            linhas = driver.find_elements(By.CSS_SELECTOR, "#tbCategorias > tbody > tr")
-            linha = linhas[i]
-
-            tds = linha.find_elements(By.TAG_NAME, "td")
-            codigo = tds[0].text.strip() if len(tds) > 0 else ""
-            descricao = tds[1].text.strip() if len(tds) > 1 else ""
-            print(f"\nCategoria: {codigo} - {descricao}")
-
-            # Clicar no botão 'olho' (3ª coluna). Evitar clicar no SVG/path.
-            try:
-                botao = linha.find_element(By.CSS_SELECTOR, "td:nth-child(3) button")
-            except Exception:
-                botao = linha.find_element(By.XPATH, ".//td[3]//button | .//td[3]//a")
-
-            # Clique com retry e espera pela TELA DE DETALHE (sinal: botão Voltar)
-            ok = click_and_wait(botao, (By.ID, "btnVoltarTbListCategorias"), max_tries=3)
-            if not ok:
-                # último recurso: forçar clique e dar mais uma chance
-                driver.execute_script("arguments[0].click();", botao)
-                WebDriverWait(driver, WAIT_LONG).until(EC.presence_of_element_located((By.ID, "btnVoltarTbListCategorias")))
-
-            # Agora buscar a tabela (algumas categorias podem não ter linhas)
-            # Tente id exato e, se não, qualquer id contendo 'tabela_body'
-            tabela = driver.find_elements(By.ID, "tabela_body")
-            if not tabela:
-                tabela = driver.find_elements(By.CSS_SELECTOR, "[id*='tabela_body']")
-
-            detalhas = []
-            if tabela:
-                # Polling leve até virem linhas (ou aceitar vazio)
-                for _ in range(int(8 / POLL_SLEEP)):  # ~8s total
-                    detalhas = driver.find_elements(By.CSS_SELECTOR, "[id*='tabela_body'] > tr")
-                    if detalhas:
-                        break
+        # esgotou as linhas da página? tenta a próxima
+        if i >= len(linhas):
+            save_progress(pagina + 1, 0)
+            if go_next_page():
+                pagina += 1
+                switch_into_categorias(driver, wait)
+                WebDriverWait(driver, WAIT_LONG).until(EC.presence_of_element_located((By.ID, "tbCategorias")))
+                set_page_size_100()
+                for _ in range(40):
                     time.sleep(POLL_SLEEP)
+                    if driver.find_elements(By.CSS_SELECTOR, "#tbCategorias > tbody > tr"):
+                        break
+                i = 0
+                save_progress(pagina, i)
+                continue
+            else:
+                break  # acabou TODAS as páginas
 
-            # Raspar os CIDs (se houver)
+        # ===== processa a linha i desta página =====
+        linha = linhas[i]
+        tds = linha.find_elements(By.TAG_NAME, "td")
+
+        # precisa ter pelo menos 3 colunas (código, descrição, botão)
+        if len(tds) < 3:
+            i += 1
+            save_progress(pagina, i)
+            continue
+
+        codigo = (tds[0].text or "").strip()
+        descricao = (tds[1].text or "").strip()
+
+        # pula linhas vazias/placeholder
+        if not codigo and not descricao:
+            i += 1
+            save_progress(pagina, i)
+            continue
+
+        print(f"\nCategoria: {codigo} - {descricao}")
+
+        # evita duplicado (já processados e com código não vazio)
+        if codigo and codigo in processed_codes:
+            print("   (já processada; pulando)")
+            i += 1
+            save_progress(pagina, i)
+            continue
+
+        # botão do olho
+        candid = linha.find_elements(By.CSS_SELECTOR, "td:nth-child(3) button")
+        if not candid:
+            candid = linha.find_elements(By.XPATH, ".//td[3]//button | .//td[3]//a")
+        if not candid:
+            i += 1
+            save_progress(pagina, i)
+            continue
+        botao = candid[0]
+
+        # abre detalhe (espera pelo botão Voltar)
+        ok = click_and_wait(botao, (By.ID, "btnVoltarTbListCategorias"), max_tries=3)
+        if not ok:
+            driver.execute_script("arguments[0].click();", botao)
+            WebDriverWait(driver, WAIT_LONG).until(EC.presence_of_element_located((By.ID, "btnVoltarTbListCategorias")))
+
+        # coleta linhas de CIDs (se houver)
+        tabela = driver.find_elements(By.ID, "tabela_body")
+        if not tabela:
+            tabela = driver.find_elements(By.CSS_SELECTOR, "[id*='tabela_body']")
+
+        detalhas = []
+        if tabela:
+            for _ in range(int(8 / POLL_SLEEP)):  # ~8s
+                detalhas = driver.find_elements(By.CSS_SELECTOR, "[id*='tabela_body'] > tr")
+                if detalhas:
+                    break
+                time.sleep(POLL_SLEEP)
+
+        out_rows = []
+        if detalhas:
             for row in detalhas:
                 cols = row.find_elements(By.TAG_NAME, "td")
                 if len(cols) >= 2:
-                    cid_codigo = cols[0].text.strip()
-                    cid_desc = cols[1].text.strip()
-                    print(f"   {cid_codigo} - {cid_desc}")
-
-            # Voltar para a lista de categorias (com retry + espera pela lista)
-            click_voltar()
-            switch_into_categorias(driver, wait)
-
-            # Pausa curta entre categorias para não “amontoar” requests no site
-            time.sleep(0.3)
-
-        # Tentar ir para a próxima página; se não tiver, encerra
-        if go_next_page():
-            pagina += 1
-            # Pausa curta entre páginas
-            time.sleep(0.5)
-            continue
+                    cid_codigo = (cols[0].text or "").strip()
+                    cid_desc   = (cols[1].text or "").strip()
+                    out_rows.append([codigo, descricao, cid_codigo, cid_desc])
         else:
-            break
+            # registre categorias sem detalhe, se quiser manter
+            out_rows.append([codigo, descricao, "", ""])
+
+        # salva Excel incremental
+        append_rows_xlsx(out_rows)
+        if codigo:
+            processed_codes.add(codigo)
+
+        # volta pra lista
+        click_voltar()
+        switch_into_categorias(driver, wait)
+
+        # avança pro próximo item da MESMA página
+        i += 1
+        save_progress(pagina, i)
+
+        time.sleep(0.3)
 
 finally:
     driver.quit()
